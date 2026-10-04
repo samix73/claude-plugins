@@ -1,0 +1,6 @@
+{
+  "name": "pr-review-guide",
+  "version": "0.1.0",
+  "description": "Guided PR review: groups a diff into related hunks, each with notes on how to review it.",
+  "types": "./types/index.d.ts"
+}

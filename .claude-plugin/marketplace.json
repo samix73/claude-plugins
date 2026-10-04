@@ -1,0 +1,7 @@
+{
+  "name": "samix-plugins",
+  "owner": { "name": "Saman Yousefisohi" },
+  "plugins": [
+    { "name": "pr-review-guide", "source": "./pr-review-guide", "description": "Guided PR review pane" }
+  ]
+}
