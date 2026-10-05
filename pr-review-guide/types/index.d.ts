@@ -19,6 +19,10 @@ export type Step = {
 }
 
 export type Review = {
+  /** Cache key of the reviewed PR or local checkout. */
+  key: string
+  /** The command arguments the guide was built from, reused by Sync. */
+  args: string
   source: string
   overview: string
   hunks: Hunk[]
