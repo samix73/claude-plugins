@@ -1,6 +1,11 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
+import { createHash } from 'node:crypto'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
 import type { Review } from '../types'
 import { languageOf, parseSymbols, renumber, splitBySymbols, symbolRule } from './ast'
 import { buildPrompt, parseDiff, parseGuide } from './diff'
@@ -14,6 +19,54 @@ const review = atom({ plugin: 'pr-review-guide', key: 'review' } as const, null)
 const status = atom({ plugin: 'pr-review-guide', key: 'status' } as const, '')
 
 type Api = EngineInterface
+
+const CACHE_DIR = join(tmpdir(), 'pr-review-guide')
+
+/**
+ * Identifies what is being reviewed, so the same PR finds its guide again. A PR is
+ * keyed by its URL, local changes by the checkout and base.
+ */
+async function cacheKey($: Api, args: string): Promise<string> {
+  const words = args.trim().split(/\s+/).filter(Boolean)
+  let id: string
+  if (words[0] === 'local') {
+    const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'])
+    id = `local\0${top.stdout.trim()}\0${words[1] ?? ''}`
+  } else {
+    const meta = await $.process.run(['gh', 'pr', 'view', ...words.slice(0, 1), '--json', 'url'])
+    let url = ''
+    try {
+      url = (JSON.parse(meta.stdout) as { url: string }).url
+    } catch {
+      // Without the URL, fall back to the arguments as typed.
+    }
+    id = `pr\0${url || words[0] || ''}`
+  }
+
+  return createHash('sha256').update(id).digest('hex').slice(0, 32)
+}
+
+const cachePath = (key: string) => join(CACHE_DIR, `${key}.json`)
+
+async function loadCached(key: string): Promise<Review | undefined> {
+  try {
+    const data = JSON.parse(await readFile(cachePath(key), 'utf8')) as Review
+    return Array.isArray(data.steps) && Array.isArray(data.hunks) && data.steps.length > 0 ? data : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function save($: Api) {
+  const r = await read($, review)
+  if (!r) return
+  try {
+    await mkdir(CACHE_DIR, { recursive: true })
+    await writeFile(cachePath(r.key), JSON.stringify(r))
+  } catch {
+    // The cache is an optimisation; the review works without it.
+  }
+}
 
 let stop = new AbortController()
 
@@ -93,10 +146,23 @@ async function splitWithAst($: Api, hunks: Hunk[], ref: string | undefined): Pro
   return renumber(hunks.flatMap(hunk => splitBySymbols(hunk, units.get(hunk.file) ?? [])))
 }
 
-const prepare = async ($: Api, args: string) => {
+const prepare = async ($: Api, args: string, isForced = false) => {
   stop.abort()
   stop = new AbortController()
   await update($, review, () => null)
+  await update($, status, () => (isForced ? 'Fetching the diff...' : 'Looking for a saved guide...'))
+
+  const key = await cacheKey($, args)
+  if (!isForced) {
+    const cached = await loadCached(key)
+    if (cached) {
+      await update($, review, () => cached)
+      await update($, status, () => '')
+      $.ui.toast('Loaded the saved review guide. Use Sync to rebuild it.')
+
+      return
+    }
+  }
   await update($, status, () => 'Fetching the diff...')
 
   const got = await fetchDiff($, args)
@@ -133,20 +199,22 @@ const prepare = async ($: Api, args: string) => {
     return
   }
 
-  const next: Review = { source: got.source, overview: guide.overview, hunks, steps: guide.steps, index: 0 }
+  const next: Review = { key, args, source: got.source, overview: guide.overview, hunks, steps: guide.steps, index: 0 }
   await update($, review, () => next)
+  await save($)
   await update($, status, () => '')
   $.ui.toast(`Review guide ready: ${next.steps.length} steps`)
 }
 
-function go($: Api, by: number) {
-  return update($, review, r =>
+async function go($: Api, by: number) {
+  await update($, review, r =>
     r ? { ...r, index: Math.min(r.steps.length - 1, Math.max(0, r.index + by)) } : r,
   )
+  await save($)
 }
 
-function toggle($: Api) {
-  return update($, review, r =>
+async function toggle($: Api) {
+  await update($, review, r =>
     r
       ? {
           ...r,
@@ -154,6 +222,7 @@ function toggle($: Api) {
         }
       : r,
   )
+  await save($)
 }
 
 export const register: Register = on => {
@@ -167,7 +236,7 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'guided-pr-review' }, async ($, e) => {
-    await $.ui.open({ id: PANE, title: 'PR review guide', closeOnEscape: true })
+    await $.ui.open({ id: PANE, title: 'PR review guide', closeOnEscape: false })
     void prepare($, e.args)
 
     return { text: 'Building the review guide. Follow it in the PR review pane.' }
@@ -192,7 +261,11 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        <Button role="dismiss" onPress={() => $.ui.close({ id: PANE })}>Close</Button>
+        <Box>
+          <Button role="dismiss" onPress={() => $.ui.close({ id: PANE })}>Close</Button>
+          <Text> </Text>
+          <Button key="sync" onPress={() => void prepare($, r.args, true)}>Sync</Button>
+        </Box>
         <Text bold>{r.source}</Text>
         <Text dimColor>{r.overview}</Text>
         <Text dimColor>
